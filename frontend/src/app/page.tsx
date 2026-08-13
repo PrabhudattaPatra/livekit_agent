@@ -44,9 +44,9 @@ export default function Home() {
       {!token ? (
         <div className="landing-view">
           <div className="hero-section">
-            <h1 className="title">Calendar Agent</h1>
+            <h1 className="title">AI Interior Design Assistant</h1>
             <p className="subtitle">
-              Your intelligent, voice-activated scheduling assistant.
+              Talk through your space, get design ideas, and book a consultation with a professional — all by voice.
             </p>
             
             <button
