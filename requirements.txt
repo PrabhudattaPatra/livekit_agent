@@ -16,3 +16,4 @@ langgraph-checkpoint-postgres
 psycopg[binary,pool]
 python-dateutil
 portkey_ai
+langchain_fireworks

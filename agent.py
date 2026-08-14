@@ -79,7 +79,7 @@ class InteriorDesignAgent(Agent):
 
     async def on_enter(self):
         await self.session.generate_reply(
-            instructions="Greet the user warmly as their interior design assistant, and invite them to tell you about the space they're looking to work on.",
+            instructions="Greet the user warmly as their interior design assistant and ask them how can you help them.",
             allow_interruptions=True,
         )
 
@@ -111,9 +111,11 @@ async def entrypoint(ctx: JobContext):
                 stream_mode="custom",
             ),
             tts=sarvam.TTS(
-                target_language_code="en-IN",  
+                target_language_code="en-IN",
                 model="bulbul:v3",
-                speaker="shubh"
+                speaker="shubh",
+                speech_sample_rate=16000,
+                pace=1.0,
             ),
             turn_detection="stt",         
             min_endpointing_delay=0.8,    
@@ -124,7 +126,60 @@ async def entrypoint(ctx: JobContext):
             agent=InteriorDesignAgent(),
             room=ctx.room,
         )
-        
+
+        # Handle prolonged user silence (right after the greeting or mid-conversation).
+        # user_away_timeout (default 15s) fires "user_state_changed" -> "away" once both the
+        # user and agent have been idle that long -- but it fires ONLY ONCE per silent
+        # stretch: user_state stays "away" and won't re-arm the framework's own timer again
+        # until real speech resets it. So the nudge -> (wait) -> goodbye escalation is driven
+        # by our own timer here, not by waiting for a second "away" event that will never come
+        # during continuous silence. If the user starts speaking at any point, we bail out.
+        away_in_progress = False
+        user_spoke = asyncio.Event()
+
+        async def _handle_user_away():
+            nonlocal away_in_progress
+            if away_in_progress:
+                return
+            away_in_progress = True
+            user_spoke.clear()
+            try:
+                await session.generate_reply(
+                    instructions=(
+                        "The user has gone quiet for a moment. Check in warmly and briefly — "
+                        "for example, ask if they're still there or need a moment to think. Keep it short."
+                    )
+                )
+                try:
+                    await asyncio.wait_for(user_spoke.wait(), timeout=15.0)
+                    return  # user responded, nothing more to do
+                except asyncio.TimeoutError:
+                    pass
+
+                await session.generate_reply(
+                    instructions=(
+                        "The user has stayed silent even after you checked in. Say a brief, warm "
+                        "goodbye and mention they're welcome to reach out again anytime."
+                    )
+                )
+                # Don't rely on the LLM to voluntarily call end_call here -- it's not a normal
+                # conversational turn, and testing showed it reliably speaks the goodbye but
+                # doesn't reliably invoke the tool on its own. Hang up deterministically instead.
+                logger.info("ending call: user stayed silent through the away check-in")
+                await ctx.delete_room()
+            except Exception:
+                logger.exception("Failed during away-state handling")
+            finally:
+                away_in_progress = False
+
+        def _on_user_state_changed(ev):
+            if ev.new_state == "speaking":
+                user_spoke.set()
+            elif ev.new_state == "away":
+                asyncio.create_task(_handle_user_away())
+
+        session.on("user_state_changed", _on_user_state_changed)
+
         background_audio = BackgroundAudioPlayer(
             ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=1.0),
         )

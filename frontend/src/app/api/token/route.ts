@@ -7,7 +7,10 @@ export async function GET(request: Request) {
     // You can pass an optional name, or we generate a random one
     const participantName = searchParams.get('name') || `User_${Math.floor(Math.random() * 1000)}`;
 
-    const roomName = 'InteriorDesignAgentRoom'; // A static room name for the demo, or make dynamic
+    // A unique room per caller -- concurrent visitors must not share a room (they'd hear
+    // each other's audio and each other's agent session, and each /api/token call would
+    // dispatch another agent into the same room on top of it).
+    const roomName = `InteriorDesignAgentRoom-${crypto.randomUUID()}`;
 
     const apiKey = process.env.LIVEKIT_API_KEY;
     const apiSecret = process.env.LIVEKIT_API_SECRET;
