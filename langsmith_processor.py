@@ -147,6 +147,32 @@ class LangSmithSpanProcessor(SpanProcessor):
             ])
             self._set_completion_attributes(span, [{"role": "assistant", "content": f"Generated audio for: {text}"}])
 
+        # Tool-call span: which tool ran, with what args, and what it returned
+        elif "function_tool" in span_name:
+            span._attributes["langsmith.span.kind"] = "tool"
+            tool_name = span.attributes.get("lk.function_tool.name", "unknown_tool")
+            tool_args = span.attributes.get("lk.function_tool.arguments", "")
+            tool_output = span.attributes.get("lk.function_tool.output", "")
+            tool_is_error = span.attributes.get("lk.function_tool.is_error", False)
+            user_context = span.attributes.get("lk.function_tool.user_context", "")
+
+            self._set_prompt_attributes(span, [{"role": "tool_call", "content": f"{tool_name}({tool_args})"}])
+            if tool_output:
+                self._set_completion_attributes(span, [{"role": "tool", "content": str(tool_output)}])
+
+            # Register the user turn that triggered this tool BEFORE folding in the tool
+            # entry, in case this span is processed before the LLM span for the same turn
+            # finishes (tool spans close mid-generation, nested inside the still-open
+            # llm_node span) -- otherwise _split_conversation_messages would silently drop
+            # a tool entry that arrives before any user message is on record for this trace.
+            if user_context:
+                self._track_messages(self.conversation_messages, trace_id, [{"role": "user", "content": user_context}], "")
+            status = "ERROR" if tool_is_error else "OK"
+            self._track_tool_call(
+                self.conversation_messages, trace_id,
+                f"[Tool call] {tool_name}({tool_args}) -> {status}: {tool_output}"
+            )
+
         # Agent/Chain/Job spans: aggregate conversation
         elif (
             "agent" in span_name
@@ -540,7 +566,11 @@ class LangSmithSpanProcessor(SpanProcessor):
         """
         if key not in target_dict:
             target_dict[key] = []
-            # Add system prompt once at the start
+        # Seed the system prompt whenever it first becomes available -- a tool-call span
+        # can create this trace's entry (via a user-only message, see _track_tool_call)
+        # before the LLM span that actually carries the system prompt has finished, so
+        # this can't be gated purely on "is this the first message we've seen" anymore.
+        if not any(isinstance(m, dict) and m.get("role") == "system" for m in target_dict[key]):
             for msg in messages:
                 if isinstance(msg, dict) and msg.get("role") == "system":
                     target_dict[key].append(msg)
@@ -571,6 +601,12 @@ class LangSmithSpanProcessor(SpanProcessor):
             ]
             if new_assistant_content not in existing_assistant_contents:
                 target_dict[key].append({"role": "assistant", "content": output_data})
+
+    def _track_tool_call(self, target_dict: dict, key: str, content: str):
+        """Append a tool-call/result entry into the running conversation transcript,
+        so the aggregated agent/session/job span shows which tools were used, not
+        just the LLM turns."""
+        target_dict.setdefault(key, []).append({"role": "tool", "content": content})
 
     def shutdown(self) -> None:
         self._flush_deferred_job_spans()

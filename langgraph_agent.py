@@ -2,6 +2,8 @@
 # LANGGRAPH INTERIOR DESIGN AGENT - LIVEKIT COMPATIBLE
 # =============================================================================
 import os
+import json
+import time
 import asyncio
 from datetime import datetime
 from typing import Type, List, Annotated
@@ -18,9 +20,11 @@ from langchain_google_community.calendar.create_event import CalendarCreateEvent
 from langchain_google_community.calendar.delete_event import CalendarDeleteEvent
 from langgraph.graph import StateGraph, START
 from typing import TypedDict
-from langchain_core.messages import BaseMessage, AIMessage, SystemMessage, HumanMessage
+from langchain_core.messages import BaseMessage, AIMessage, SystemMessage, HumanMessage, ToolMessage
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
+from langchain.agents.middleware import SummarizationMiddleware
+from livekit.agents.telemetry import tracer, trace_types
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -298,7 +302,7 @@ class ChatState(TypedDict):
 # =============================================================================
 
 system_prompt_template = """
-You are a friendly, knowledgeable voice assistant for an interior design studio. You help callers explore ideas for their homes — layout, style, color, furniture — offer practical design guidance, and, when it makes sense, help them book a consultation with one of our professional interior designers.
+You are a friendly, knowledgeable voice assistant for Aethel Studio, an interior design studio. You help callers explore ideas for their homes — layout, style, color, furniture — offer practical design guidance, and, when it makes sense, help them book a consultation with one of our professional interior designers.
 Today's date and time is: {current_datetime}.
 
 # Output rules
@@ -344,28 +348,29 @@ You are interacting with the user via voice through a text-to-speech system. App
  DESIGN DISCOVERY
 ==========================================
 
-Your goal before offering ideas or a consultation is to understand the user's space and what they're trying to achieve. This is a conversation, not an intake form — there is no fixed order and no requirement to cover everything.
+Your goal before offering ideas or a consultation is to get a quick, high-value read on the user's space and what they're trying to achieve — not a full intake. Ask no more than 3 to 4 questions total during discovery (this does not include name, email, or preferred date and time — those only come up later, if and when they book).
 
-Over the course of the conversation, naturally surface:
+Choose whichever of these matter most for what the user has already told you:
 - Home or room type (e.g. apartment bedroom, kitchen, living room)
-- Approximate room dimensions or layout, if the user knows them
 - Style preferences (e.g. modern, minimal, traditional, cozy)
 - Budget range
+- Renovation goals or pain points with the current space
 - Furniture requirements — what they already have versus what they need
 - Color preferences
 - Lifestyle factors (kids, pets, working from home, entertaining guests)
-- Renovation goals or pain points with the current space
+- Approximate room dimensions or layout, if the user knows them
 
-Ask one or two questions at a time, and always react to what they just told you before moving to the next thing — this should feel like talking to a friend who knows design, not filling out a form. Skip anything the user has already volunteered. If someone mentions a small, dark room, offer a quick idea in the moment — for example, suggesting lighter tones or mirrors — rather than saving all your input for the end. You don't need to cover every topic before offering guidance or a consultation — follow the conversation's natural direction.
+Ask one or two questions at a time, and always react to what they just told you before moving to the next thing — this should feel like talking to a friend who knows design, not filling out a form. Skip anything the user has already volunteered, and skip anything that doesn't matter for their specific situation. If someone mentions a small, dark room, offer a quick idea in the moment — for example, suggesting lighter tones or mirrors — rather than saving all your input for the end. Once you've asked around 3 to 4 of these, stop probing and move on to offering guidance or a consultation — don't keep discovery going indefinitely.
 
 ==========================================
  WHEN TO OFFER A PROFESSIONAL CONSULTATION
 ==========================================
 
-Offer to connect the user with one of our professional interior designers when:
+Once you've asked your 3 to 4 discovery questions, if the user seems interested — engaged, asking what's next, excited about the ideas you've shared, or simply not looking to end the call — proactively ask if they'd like to book a consultation with one of our professional interior designers. Don't wait for them to bring it up first.
+
+Also offer right away, regardless of where you are in discovery, when:
 - They explicitly ask for a designer, a quote, pricing, or next steps.
 - Their project involves structural, electrical, or plumbing changes, a multi-room renovation, or a defined budget beyond casual DIY.
-- They've shared enough (style, budget, rooms, goals) that the conversation is naturally shifting from ideas to execution.
 - They express uncertainty even after you've offered guidance (e.g. "I still don't really know what to do").
 
 Offer once, don't push. Example: "It sounds like you have a good sense of what you want — would you like me to set up a time for you to talk with one of our professional interior designers to help bring it all together?" If they decline, keep helping conversationally, and only bring it up again if the conversation naturally circles back to it.
@@ -460,6 +465,39 @@ Step 4: EXECUTE
 # Dynamic ACK Generation
 ack_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.7)
 
+# Compresses older turns into a running summary once the conversation crosses ~20
+# messages, keeping the most recent 12 verbatim. Reuses ack_llm (fast/cheap Groq
+# model already used for tool-ack phrases) since this is a background bookkeeping
+# call, not something the caller needs a "smart" model for. Message-count based
+# (not token-based) to match the rest of this codebase and avoid needing model
+# profile/context-limit data we don't have visibility into via Portkey.
+#
+# Uses a custom summary_prompt instead of the middleware's default -- the default is
+# written for coding agents ("SESSION INTENT / ARTIFACTS / NEXT STEPS") and, tested
+# live against ack_llm, reliably let concrete facts (a caller's name and email) get
+# paraphrased away as "not directly related to booking an appointment" instead of
+# preserved. For a booking call, caller-provided facts (name, email, phone, room type,
+# budget, dates, preferences) are exactly what must never be lost, so the prompt below
+# demands they come through verbatim.
+BOOKING_SUMMARY_PROMPT = """You are compressing an interior design consultation phone call so the assistant can resume it seamlessly without losing anything the caller already said.
+
+Extract every concrete fact the caller has given so far. Do NOT omit, generalize, or paraphrase away any specific value: names, email addresses, phone numbers, room types, budgets, dates/times, style preferences, and any appointment details already discussed or confirmed. If a fact was stated, it MUST appear verbatim in your output, even if it seems unrelated to what happens next -- you cannot judge what will matter later.
+
+Respond with:
+KNOWN FACTS: a bulleted list of every concrete fact stated so far (verbatim values, not summarized).
+WHERE WE LEFT OFF: one line describing what was being discussed or decided.
+
+Conversation so far:
+{messages}
+"""
+
+summarization_middleware = SummarizationMiddleware(
+    model=ack_llm,
+    trigger=("messages", 20),
+    keep=("messages", 12),
+    summary_prompt=BOOKING_SUMMARY_PROMPT,
+)
+
 async def generate_dynamic_ack(tool_call: dict, user_message: str) -> str:
     """Generates a fast, natural ACK phrase based on the tool and user context."""
     tool_name = tool_call.get("name", "")
@@ -481,6 +519,16 @@ async def generate_dynamic_ack(tool_call: dict, user_message: str) -> str:
         return "One moment please..." # Fallback
 
 
+async def summarize_node(state: ChatState):
+    """Runs before chat_node on every turn. A no-op (returns {}) on the vast majority
+    of turns where the message-count threshold hasn't been crossed. When it does fire,
+    the update (RemoveMessage(REMOVE_ALL_MESSAGES) + summary + preserved messages) is
+    applied to the checkpointed state via the add_messages reducer, so the compression
+    actually persists in Postgres -- unlike chat_node's old [-10:] slice, this isn't
+    recomputed from scratch (and thrown away) on every single turn."""
+    result = await summarization_middleware.abefore_model(state, None)
+    return result or {}
+
 
 async def chat_node(state: ChatState):
     """Async LLM node with duplicate message deduplication."""
@@ -498,7 +546,7 @@ async def chat_node(state: ChatState):
             continue
         deduplicated.append(msg)
 
-    recent_messages = deduplicated[-10:]
+    recent_messages = deduplicated  # bounding now happens upstream in summarize_node
 
     # ✅ FIX 1: Fresh timestamp on every request — never stale after deploy
     current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -562,7 +610,10 @@ async def chat_node(state: ChatState):
 
 
 async def tool_node_with_ack(state: ChatState):
-    """Sends a dynamic verbal status update if the tool takes longer than 0.5s."""
+    """Sends a dynamic verbal status update if the tool takes longer than 0.5s.
+    Also emits one OTel 'function_tool' span per tool call (matching LiveKit Agents'
+    own span shape) so LangSmith shows which tools were invoked, with what arguments,
+    and what they returned."""
     messages = state["messages"]
     last_message = messages[-1] if messages else None
     user_message = next((m.content for m in reversed(messages) if isinstance(m, HumanMessage)), "")
@@ -571,14 +622,14 @@ async def tool_node_with_ack(state: ChatState):
     status_task = None
     if tool_calls:
         tool_name = tool_calls[0].get("name", "")
-        
+
         async def _speak_status_update(delay: float = 0.5):
             await asyncio.sleep(delay)
             try:
                 stream_writer = get_stream_writer()
                 # Generate dynamic ACK based on context since tool is taking a while
                 ack = await generate_dynamic_ack(tool_calls[0], user_message)
-                stream_writer(ack) 
+                stream_writer(ack)
             except asyncio.CancelledError:
                 pass
             except Exception:
@@ -588,13 +639,46 @@ async def tool_node_with_ack(state: ChatState):
         status_task = asyncio.create_task(_speak_status_update(0.5))
 
     tool_node = ToolNode(tools)
+    start_time = time.time_ns()
     try:
-        result = await tool_node.ainvoke(state) 
+        result = await tool_node.ainvoke(state)
     finally:
         # Cancel status update if tool completes before timeout
         if status_task:
             status_task.cancel()
-            
+    end_time = time.time_ns()
+
+    # ToolNode gives us no per-call hook, so synthesize spans post-hoc: match each
+    # tool_call to its ToolMessage result by tool_call_id and give it the same span
+    # name/attributes LiveKit Agents' own tool-calling loop uses (generation.py's
+    # "function_tool" span), so langsmith_processor.py can translate it into a
+    # LangSmith "tool" run without needing to know this is a LangGraph-internal call.
+    if tool_calls:
+        result_messages = result.get("messages", []) if isinstance(result, dict) else []
+        outputs_by_id = {
+            m.tool_call_id: m for m in result_messages if isinstance(m, ToolMessage)
+        }
+        for call in tool_calls:
+            call_id = call.get("id")
+            output_msg = outputs_by_id.get(call_id)
+            output_text = str(output_msg.content) if output_msg else ""
+            is_error = output_text.startswith("TOOL_ERROR:")
+            span = tracer.start_span(
+                "function_tool",
+                start_time=start_time,
+                attributes={
+                    trace_types.ATTR_FUNCTION_TOOL_ID: call_id or "",
+                    trace_types.ATTR_FUNCTION_TOOL_NAME: call.get("name", ""),
+                    trace_types.ATTR_FUNCTION_TOOL_ARGS: json.dumps(call.get("args", {})),
+                    trace_types.ATTR_FUNCTION_TOOL_OUTPUT: output_text,
+                    trace_types.ATTR_FUNCTION_TOOL_IS_ERROR: is_error,
+                    # Bridges the tool call into langsmith_processor's running
+                    # conversation transcript for this trace.
+                    "lk.function_tool.user_context": str(user_message),
+                },
+            )
+            span.end(end_time=end_time)
+
     return result
 
 
@@ -605,10 +689,12 @@ async def tool_node_with_ack(state: ChatState):
 def create_interior_design_graph(checkpointer=None):
     graph = StateGraph(ChatState)
 
+    graph.add_node("summarize", summarize_node)
     graph.add_node("chat_node", chat_node)
     graph.add_node("tools", tool_node_with_ack)
 
-    graph.add_edge(START, "chat_node")
+    graph.add_edge(START, "summarize")
+    graph.add_edge("summarize", "chat_node")
     graph.add_conditional_edges("chat_node", tools_condition)
     graph.add_edge("tools", "chat_node")
 

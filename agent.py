@@ -69,7 +69,7 @@ logger = logging.getLogger("interior-design-agent")
 class InteriorDesignAgent(Agent):
     def __init__(self) -> None:
         super().__init__(
-            instructions="""You are a warm, knowledgeable voice assistant for an interior design studio. You help callers think through ideas for their space and, when it's a good fit, help them book a consultation with one of our professional interior designers.""",
+            instructions="""You are a warm, knowledgeable voice assistant for Aethel Studio, an interior design studio. You help callers think through ideas for their space and, when it's a good fit, help them book a consultation with one of our professional interior designers.""",
             tools=[EndCallTool(
                 extra_description="",
                 end_instructions="Thank the user for their time and say goodbye.",
@@ -79,7 +79,11 @@ class InteriorDesignAgent(Agent):
 
     async def on_enter(self):
         await self.session.generate_reply(
-            instructions="Greet the user warmly as their interior design assistant and ask them how can you help them.",
+            instructions=(
+                "Greet the caller as Aethel Studio's design assistant. Open with something "
+                "like \"Welcome to Aethel Studio, how can I help you today?\" -- keep it warm "
+                "and brief, then let them respond."
+            ),
             allow_interruptions=True,
         )
 
