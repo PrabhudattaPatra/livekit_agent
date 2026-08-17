@@ -478,13 +478,15 @@ Step 4: EXECUTE
 # PART 5: Nodes
 # =============================================================================
 
-# Dynamic ACK Generation
+# Small/cheap utility model. Formerly also used to generate tool-call ack phrases
+# live (see TOOL_ACK_PHRASES above for why that was replaced with a hardcoded dict) --
+# its only remaining job is conversation summarization, below.
 ack_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.7)
 
 # Compresses older turns into a running summary once the conversation crosses ~20
 # messages, keeping the most recent 12 verbatim. Reuses ack_llm (fast/cheap Groq
-# model already used for tool-ack phrases) since this is a background bookkeeping
-# call, not something the caller needs a "smart" model for. Message-count based
+# model) since this is a background bookkeeping call, not something the caller needs
+# a "smart" model for. Message-count based
 # (not token-based) to match the rest of this codebase and avoid needing model
 # profile/context-limit data we don't have visibility into via Portkey.
 #
