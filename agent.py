@@ -121,9 +121,17 @@ async def entrypoint(ctx: JobContext):
                 speech_sample_rate=16000,
                 pace=1.0,
             ),
-            turn_detection="stt",         
-            min_endpointing_delay=0.8,    
-            preemptive_generation=False, 
+            turn_detection="stt",
+            min_endpointing_delay=0.8,
+            # Speculatively kicks off LLM+TTS as soon as a transcript arrives, instead of
+            # waiting out the full min_endpointing_delay (800ms) turn-confirmation pause
+            # first, overlapping that wait with generation instead of paying both serially.
+            # Kept on after switching the main LLM to Sarvam (see langgraph_agent.py) --
+            # still a free latency win even with Sarvam's faster TTFT. Tradeoff: if the
+            # user keeps talking past a non-final transcript, the speculative call is
+            # wasted (extra Sarvam spend) -- LiveKit's own turn-taking cancels/redoes it
+            # automatically, so this is a cost tradeoff, not a correctness risk.
+            preemptive_generation=True,
         )
 
         await session.start(
@@ -183,6 +191,60 @@ async def entrypoint(ctx: JobContext):
                 asyncio.create_task(_handle_user_away())
 
         session.on("user_state_changed", _on_user_state_changed)
+
+        # Voice-pipeline latency SLA logging. AgentSession already computes these numbers
+        # internally (per-component metrics from the STT/LLM/TTS plugins, plus VAD-based
+        # end-of-utterance timing) -- this just surfaces them per turn so regressions are
+        # visible in the logs instead of only being felt as "the agent feels slow". Targets:
+        #   STT effective latency (via EOU transcription_delay, see caveat below): 100-150ms
+        #   LLM time-to-first-token:                                              150-250ms
+        #   TTS time-to-first-audio-byte:                                         75-150ms
+        def _on_metrics_collected(ev):
+            m = ev.metrics
+            if m.type == "eou_metrics":
+                # transcription_delay = last_final_transcript_time - last_speaking_time,
+                # where last_speaking_time comes from a VAD "stopped speaking" event
+                # (livekit-agents' audio_recognition.py). turn_detection="stt" (below) has
+                # no separate VAD driving that timestamp, so this is *always* 0 in this
+                # config -- not evidence STT is fast, just this metric not applying here.
+                # Live-tested and confirmed: two real turns both read exactly 0ms.
+                #
+                # end_of_utterance_delay isn't a substitute ASR-speed number either: it's
+                # time-since-last-speech until the turn is committed, intentionally floored
+                # by min_endpointing_delay (0.8s here) -- the deliberate "make sure they're
+                # done talking" wait, not STT latency. Scoring it against the 100-150ms
+                # target would read "SLOW" on every single turn by construction, which is
+                # the same false signal in the other direction. Log it unscored, for
+                # context only.
+                eou_ms = m.end_of_utterance_delay * 1000
+                if m.transcription_delay > 0:
+                    ms = m.transcription_delay * 1000
+                    status = "OK" if ms <= 150 else "SLOW"
+                    logger.info(
+                        "[SLA] STT transcription_delay=%.0fms (target 100-150ms) [%s]",
+                        ms, status,
+                    )
+                else:
+                    logger.info(
+                        "[SLA] STT transcription_delay=n/a (turn_detection='stt' has no "
+                        "separate VAD timing) | end_of_utterance_delay=%.0fms "
+                        "(includes the configured min_endpointing_delay wait, not scored)",
+                        eou_ms,
+                    )
+            elif m.type == "llm_metrics":
+                ms = m.ttft * 1000
+                status = "OK" if ms <= 250 else "SLOW"
+                logger.info("[SLA] LLM ttft=%.0fms (target 150-250ms) [%s]", ms, status)
+            elif m.type == "tts_metrics":
+                ms = m.ttfb * 1000
+                status = "OK" if ms <= 150 else "SLOW"
+                logger.info("[SLA] TTS ttfb=%.0fms (target 75-150ms) [%s]", ms, status)
+            elif m.type == "stt_metrics" and not m.streamed:
+                # Only meaningful for non-streaming STT -- duration is 0.0 while streaming
+                # (which is what this agent uses), so skip logging a always-zero number.
+                logger.info("[SLA] STT duration=%.0fms (non-streaming)", m.duration * 1000)
+
+        session.on("metrics_collected", _on_metrics_collected)
 
         background_audio = BackgroundAudioPlayer(
             ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=1.0),

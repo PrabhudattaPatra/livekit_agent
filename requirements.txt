@@ -5,6 +5,7 @@ langchain-groq
 langchain-google-community
 langgraph
 sarvamai
+langchain-sarvam
 langchain-google-genai
 opentelemetry-exporter-otlp
 google-auth-oauthlib
@@ -15,5 +16,4 @@ tzdata
 langgraph-checkpoint-postgres
 psycopg[binary,pool]
 python-dateutil
-portkey_ai
 langchain_fireworks
