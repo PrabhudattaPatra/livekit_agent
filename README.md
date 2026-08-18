@@ -22,11 +22,11 @@ Other things the agent handles on its own:
   if they stay silent.
 - **Concurrent callers** — each browser session gets its own LiveKit room and its own
   LangGraph thread, so simultaneous calls don't cross-talk.
-- **Tool-call filler phrases** — if a Calendar tool call (e.g. booking, searching slots)
-  takes longer than 0.5s, the agent speaks a short hardcoded per-tool acknowledgment
-  ("Okay, booking that consultation for you now.") so the caller isn't left in silence;
-  skipped entirely if the tool finishes first. See `TOOL_ACK_PHRASES` /
-  `tool_node_with_ack` in `langgraph_agent.py`.
+- **Tool-call filler phrases** — the instant the LLM commits to a Calendar tool call
+  (booking, searching slots, etc.), the agent immediately speaks a short hardcoded
+  per-tool acknowledgment ("Okay, booking that consultation for you now.") so the caller
+  isn't left in silence while the tool actually runs. Always spoken, not gated behind a
+  delay — see `TOOL_ACK_PHRASES` / `get_ack_phrase` in `chat_node`, `langgraph_agent.py`.
 - **Tracing** — a custom OpenTelemetry span processor (`langsmith_processor.py`) reshapes
   LiveKit's STT/LLM/TTS/tool spans into a single coherent LangSmith conversation thread,
   including which Calendar tools ran, with what arguments and results.
