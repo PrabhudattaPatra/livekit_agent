@@ -12,7 +12,7 @@ those two files to rebrand it.
 
 ## How it works
 
-![Architecture: caller audio flows through LiveKit into agent.py's Sarvam STT, a LangGraph agent (summarize_node, chat_node, tools, Portkey-routed LLM), and Sarvam TTS, back to the caller](image.png)
+![Architecture: caller audio flows through LiveKit into agent.py's Sarvam STT, a LangGraph agent (summarize_node, chat_node, tools, Sarvam LLM), and Sarvam TTS, back to the caller](image.png)
 
 Editable source: [`architecture.excalidraw`](architecture.excalidraw) (open at
 [excalidraw.com](https://excalidraw.com) or with the Excalidraw VS Code extension).
@@ -22,6 +22,11 @@ Other things the agent handles on its own:
   if they stay silent.
 - **Concurrent callers** — each browser session gets its own LiveKit room and its own
   LangGraph thread, so simultaneous calls don't cross-talk.
+- **Tool-call filler phrases** — the instant the LLM commits to a Calendar tool call
+  (booking, searching slots, etc.), the agent immediately speaks a short hardcoded
+  per-tool acknowledgment ("Okay, booking that consultation for you now.") so the caller
+  isn't left in silence while the tool actually runs. Always spoken, not gated behind a
+  delay — see `TOOL_ACK_PHRASES` / `get_ack_phrase` in `chat_node`, `langgraph_agent.py`.
 - **Tracing** — a custom OpenTelemetry span processor (`langsmith_processor.py`) reshapes
   LiveKit's STT/LLM/TTS/tool spans into a single coherent LangSmith conversation thread,
   including which Calendar tools ran, with what arguments and results.
@@ -31,7 +36,7 @@ Other things the agent handles on its own:
 | Path | Purpose |
 |---|---|
 | `agent.py` | LiveKit worker entry point. Builds the `AgentSession` (STT/LLM/TTS), wires up tracing and Google credentials, handles silence/away and hangup. |
-| `langgraph_agent.py` | The agent's brain: the LangGraph graph, the system prompt, the Google Calendar tool wrappers, conversation summarization. |
+| `langgraph_agent.py` | The agent's brain: the LangGraph graph, the system prompt, the Google Calendar tool wrappers, tool-call ack phrases, conversation summarization. |
 | `langsmith_processor.py` | OpenTelemetry → LangSmith span translator. |
 | `reauth_google.py` | One-time local script to produce `token.json` for Google Calendar OAuth. |
 | `agent.ipynb` | Notebook mirror of the agent logic for interactive iteration (not part of the deployed path). |
@@ -43,9 +48,9 @@ Other things the agent handles on its own:
 - Python 3.13 (see `.python-version`) and [`uv`](https://docs.astral.sh/uv/) (or plain `pip`)
 - Node.js 20+
 - A [LiveKit Cloud](https://cloud.livekit.io) project
-- API keys: [Sarvam AI](https://www.sarvam.ai) (STT/TTS), [Groq](https://groq.com),
-  [Portkey](https://portkey.ai) (LLM gateway), a Google Cloud project with the Calendar API
-  enabled
+- API keys: [Sarvam AI](https://www.sarvam.ai) (STT/TTS *and* the main conversational LLM),
+  [Groq](https://groq.com) (small utility calls only), a Google Cloud project with the
+  Calendar API enabled
 - Optional: a Postgres database (for conversation persistence across reconnects) and a
   LangSmith project (for tracing)
 
@@ -103,10 +108,8 @@ Backend (`.env`, loaded via `python-dotenv`):
 | Variable | Purpose |
 |---|---|
 | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | LiveKit project credentials |
-| `SARVAM_API_KEY` | Sarvam STT/TTS |
-| `GROQ_API_KEY` | Groq, called directly (not through Portkey) for small utility calls — tool-ack phrases, conversation summarization |
-| `PORTKEY_API_KEY` | Portkey gateway, which routes the main conversational LLM (its provider credentials for the Groq/Fireworks targets it load-balances/falls back across are configured in the Portkey dashboard, not read from this repo's env vars) |
-| `FIREWORKS_API_KEY` | *Optional here* — only needed if you call Fireworks directly outside of Portkey's own routing config |
+| `SARVAM_API_KEY` | Sarvam STT/TTS *and* the main conversational LLM (`ChatSarvam`, `sarvam-105b-conversations`) |
+| `GROQ_API_KEY` | Groq, called directly for a small utility model (`ack_llm`) used only for conversation summarization |
 | `GOOGLE_API_KEY` | Google Cloud / Calendar API |
 | `DATABASE_URL` | *Optional.* Enables a Postgres-backed LangGraph checkpointer for conversation persistence across turns/reconnects. Without it, the graph runs with no persistence. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TIMEOUT` | *Optional.* LangSmith tracing via OpenTelemetry. |
@@ -118,18 +121,3 @@ gitignored). In deployment, those files won't exist in the image — `agent.py`'
 `GOOGLE_TOKEN_JSON` env vars instead.
 
 Frontend (`frontend/.env.local`): `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`.
-
-## Deployment
-
-- **Backend** — Railway (or any Docker host), building the root `Dockerfile` directly. It
-  only packages the Python backend (`frontend/` is excluded via `.dockerignore`) and runs
-  `python agent.py start`.
-- **Frontend** — deploys separately; `frontend/railway.json` forces the Nixpacks builder on
-  Node 20+.
-
-## Notes
-
-- There is no automated test suite in this repo currently — changes are verified by running
-  the worker locally (`python agent.py dev`) against a real LiveKit room.
-- `frontend/` has its own `CLAUDE.md`/`AGENTS.md` with Next.js-specific conventions — read
-  that before making frontend changes.

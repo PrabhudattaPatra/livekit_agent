@@ -1,6 +1,4 @@
-# =============================================================================
-# LANGGRAPH INTERIOR DESIGN AGENT - LIVEKIT COMPATIBLE
-# =============================================================================
+
 import os
 import json
 import time
@@ -27,9 +25,6 @@ from livekit.agents.telemetry import tracer, trace_types
 from dotenv import load_dotenv
 load_dotenv()
 
-# =============================================================================
-# PART 1: Helper — Sanitize raw Calendar API output
-# =============================================================================
 
 def _sanitize_events(raw) -> str:
     if not raw:
@@ -48,7 +43,6 @@ def _sanitize_events(raw) -> str:
         entry["title"] = ev.get("summary", "Untitled")
         entry["status"] = ev.get("status", "confirmed")
 
-        # ✅ FIX: handle both dict and string formats for start/end
         start = ev.get("start", {})
         end   = ev.get("end", {})
 
@@ -80,10 +74,6 @@ def _sanitize_events(raw) -> str:
     import json
     return json.dumps(clean, ensure_ascii=False, indent=2)
 
-
-# =============================================================================
-# PART 1: Custom Tools
-# =============================================================================
 
 class SearchInput(BaseModel):
     min_datetime: str = Field(description="Start of search range (YYYY-MM-DD HH:MM:SS)")
@@ -226,7 +216,7 @@ class CustomCalendarUpdateTool(BaseTool):
 
     def _invoke_tool(self, event_id: str, summary: str, start_datetime: str, end_datetime: str) -> str:
         payload = {
-            "timezone": "Asia/Calcutta",  # ✅ fixed
+            "timezone": "Asia/Calcutta",  
             "send_updates": "all",
             "event_id": event_id, "summary": summary,
             "start_datetime": start_datetime, "end_datetime": end_datetime,
@@ -266,9 +256,6 @@ class DeleteEventTool(BaseTool):
             return "TOOL_ERROR: Could not cancel the appointment. Ask the user to try again later."
 
 
-# =============================================================================
-# PART 2: Initialize Tools & LLM
-# =============================================================================
 
 tools = [
     CustomCalendarSearchTool(),
@@ -294,28 +281,15 @@ TOOL_ACK_PHRASES = {
 DEFAULT_ACK_PHRASE = "One moment please..."
 
 
-# Main LLM: Sarvam's official langchain-sarvam integration (ChatSarvam), not the
-# OpenAI-compat shim -- gives correct message-type handling, ChatSarvamError instead of
-# generic OpenAI exceptions, and native reasoning_effort/structured-output support.
-# Reads SARVAM_API_KEY from the environment automatically. Switched from
-# Portkey->Groq/Fireworks loadbalance after live TTFT testing showed Sarvam's
-# India-hosted endpoint is consistently 1.2-4.1x faster time-to-first-token for this
-# workload, with correct tool-calling and Hinglish code-mixing verified against the
-# real system prompt/tools across multiple scenarios.
 response_model = ChatSarvam(model="sarvam-105b-conversations", temperature=0)
 
 llm_with_tools = response_model.bind_tools(tools)
 
-# =============================================================================
-# PART 3: State Definition
-# =============================================================================
 
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 
-# =============================================================================
-# PART 4: System Prompt
-# =============================================================================
+
 
 system_prompt_template = """
 You are a friendly, knowledgeable voice assistant for Aethel Studio, an interior design studio. You help callers explore ideas for their homes — layout, style, color, furniture — offer practical design guidance, and, when it makes sense, help them book a consultation with one of our professional interior designers.
@@ -474,17 +448,16 @@ Step 4: EXECUTE
 
 """
 
-# =============================================================================
-# PART 5: Nodes
-# =============================================================================
 
-# Dynamic ACK Generation
+# Small/cheap utility model. Formerly also used to generate tool-call ack phrases
+# live (see TOOL_ACK_PHRASES above for why that was replaced with a hardcoded dict) --
+# its only remaining job is conversation summarization, below.
 ack_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.7)
 
 # Compresses older turns into a running summary once the conversation crosses ~20
 # messages, keeping the most recent 12 verbatim. Reuses ack_llm (fast/cheap Groq
-# model already used for tool-ack phrases) since this is a background bookkeeping
-# call, not something the caller needs a "smart" model for. Message-count based
+# model) since this is a background bookkeeping call, not something the caller needs
+# a "smart" model for. Message-count based
 # (not token-based) to match the rest of this codebase and avoid needing model
 # profile/context-limit data we don't have visibility into via Portkey.
 #
@@ -537,7 +510,6 @@ async def chat_node(state: ChatState):
     """Async LLM node with duplicate message deduplication."""
     messages = state["messages"]
 
-    # ✅ Remove consecutive duplicate assistant messages
     deduplicated = []
     for msg in messages:
         if (
@@ -549,21 +521,11 @@ async def chat_node(state: ChatState):
             continue
         deduplicated.append(msg)
 
-    recent_messages = deduplicated  # bounding now happens upstream in summarize_node
+    recent_messages = deduplicated
 
-    # ✅ FIX 1: Fresh timestamp on every request — never stale after deploy
     current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     live_system_prompt = system_prompt_template.format(current_datetime=current_datetime)
 
-    # ✅ FIX 2: Guarantee at least one "user" turn. Whenever generate_reply(instructions=...)
-    # is used without any prior real user message — the on_enter() greeting, or later an
-    # away-state check-in/goodbye while the caller has never actually spoken — LiveKit only
-    # adds a system-role instructions message to the chat context, with no HumanMessage.
-    # Some strict chat templates (e.g. Groq's Qwen models) raise "No user query found in
-    # messages" if the request has zero user-role turns, so inject a placeholder one
-    # whenever that's the case. Keep this NEUTRAL (not "greet them") — it fires on every
-    # such turn, not just the first, and specific wording here would override whatever the
-    # real generate_reply(instructions=...) for that turn actually asked for.
     if not any(isinstance(m, HumanMessage) for m in recent_messages):
         recent_messages = recent_messages + [
             HumanMessage(content="(The user hasn't said anything yet.)")
@@ -574,12 +536,29 @@ async def chat_node(state: ChatState):
     stream_writer = get_stream_writer()
     full_response = None
     stop_streaming = False
-    
+    ack_spoken = False
+
     try:
         async for chunk in llm_with_tools.astream(messages_with_system):
             # If Langchain detects a tool call chunk, stop streaming text
-            if getattr(chunk, "tool_calls", None) or getattr(chunk, "tool_call_chunks", None):
+            tool_call_chunks = getattr(chunk, "tool_call_chunks", None)
+            if getattr(chunk, "tool_calls", None) or tool_call_chunks:
                 stop_streaming = True
+                # Speak the hardcoded ack the instant the tool's name is known --
+                # the `name` field arrives on the first chunk, before `args` streams
+                # in (see langchain_core.messages.tool.ToolCallChunk) -- so we don't
+                # have to wait for the full tool-call JSON to finish generating, let
+                # alone the extra 0.5s gate tool_node_with_ack used to add on top of
+                # that. This is the dominant latency in a tool-calling turn, so speak
+                # unconditionally here rather than gating on the tool turning out slow.
+                if not ack_spoken and tool_call_chunks:
+                    tool_name = next(
+                        (tc.get("name") for tc in tool_call_chunks if tc.get("name")),
+                        None,
+                    )
+                    if tool_name:
+                        stream_writer(get_ack_phrase({"name": tool_name}))
+                        ack_spoken = True
 
             if (
                 chunk.content
@@ -613,49 +592,22 @@ async def chat_node(state: ChatState):
 
 
 async def tool_node_with_ack(state: ChatState):
-    """Sends a dynamic verbal status update if the tool takes longer than 0.5s.
-    Also emits one OTel 'function_tool' span per tool call (matching LiveKit Agents'
-    own span shape) so LangSmith shows which tools were invoked, with what arguments,
-    and what they returned."""
+    """Runs the actual tool call and emits one OTel 'function_tool' span per tool call
+    (matching LiveKit Agents' own span shape) so LangSmith shows which tools were
+    invoked, with what arguments, and what they returned. The verbal ack itself is no
+    longer spoken from here -- chat_node now fires it the instant the tool name is
+    known from the LLM's stream, well before this node even starts (see chat_node's
+    ack_spoken handling) -- so this node just does the call + tracing."""
     messages = state["messages"]
     last_message = messages[-1] if messages else None
     user_message = next((m.content for m in reversed(messages) if isinstance(m, HumanMessage)), "")
     tool_calls = getattr(last_message, "tool_calls", []) if last_message else []
 
-    status_task = None
-    if tool_calls:
-        tool_name = tool_calls[0].get("name", "")
-
-        async def _speak_status_update(delay: float = 0.5):
-            await asyncio.sleep(delay)
-            try:
-                stream_writer = get_stream_writer()
-                # Look up a hardcoded ACK phrase since tool is taking a while
-                ack = get_ack_phrase(tool_calls[0])
-                stream_writer(ack)
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
-
-        # Start the timer task
-        status_task = asyncio.create_task(_speak_status_update(0.5))
-
     tool_node = ToolNode(tools)
     start_time = time.time_ns()
-    try:
-        result = await tool_node.ainvoke(state)
-    finally:
-        # Cancel status update if tool completes before timeout
-        if status_task:
-            status_task.cancel()
+    result = await tool_node.ainvoke(state)
     end_time = time.time_ns()
 
-    # ToolNode gives us no per-call hook, so synthesize spans post-hoc: match each
-    # tool_call to its ToolMessage result by tool_call_id and give it the same span
-    # name/attributes LiveKit Agents' own tool-calling loop uses (generation.py's
-    # "function_tool" span), so langsmith_processor.py can translate it into a
-    # LangSmith "tool" run without needing to know this is a LangGraph-internal call.
     if tool_calls:
         result_messages = result.get("messages", []) if isinstance(result, dict) else []
         outputs_by_id = {
@@ -685,9 +637,6 @@ async def tool_node_with_ack(state: ChatState):
     return result
 
 
-# =============================================================================
-# PART 6: Build & Compile Graph
-# =============================================================================
 
 def create_interior_design_graph(checkpointer=None):
     graph = StateGraph(ChatState)

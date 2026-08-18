@@ -3,6 +3,13 @@ import sys
 
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # Windows' default console codepage (cp1252) can't encode the emoji used in
+    # this file's/log's status prints (e.g. setup_langsmith's checkmarks) -- it
+    # crashes with UnicodeEncodeError as soon as stdout isn't an interactive
+    # UTF-8 terminal (piped output, `> file.log`, some CI runners). Force UTF-8
+    # unconditionally so those prints never take the process down.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import logging
 import uuid
