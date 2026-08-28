@@ -3,6 +3,8 @@ import sys
 
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import logging
 import uuid
@@ -80,7 +82,7 @@ class InteriorDesignAgent(Agent):
     async def on_enter(self):
         await self.session.generate_reply(
             instructions=(
-                "Greet the caller as Aethel Studio's design assistant. Open with something "
+                "Greet the caller as Aethel Studio's design assistant in English. Open with something "
                 "like \"Welcome to Aethel Studio, how can I help you today?\" -- keep it warm "
                 "and brief, then let them respond."
             ),
@@ -117,20 +119,12 @@ async def entrypoint(ctx: JobContext):
             tts=sarvam.TTS(
                 target_language_code="en-IN",
                 model="bulbul:v3",
-                speaker="shubh",
+                speaker="priya",
                 speech_sample_rate=16000,
-                pace=1.0,
+                pace=1.15,
             ),
             turn_detection="stt",
-            min_endpointing_delay=0.8,
-            # Speculatively kicks off LLM+TTS as soon as a transcript arrives, instead of
-            # waiting out the full min_endpointing_delay (800ms) turn-confirmation pause
-            # first, overlapping that wait with generation instead of paying both serially.
-            # Kept on after switching the main LLM to Sarvam (see langgraph_agent.py) --
-            # still a free latency win even with Sarvam's faster TTFT. Tradeoff: if the
-            # user keeps talking past a non-final transcript, the speculative call is
-            # wasted (extra Sarvam spend) -- LiveKit's own turn-taking cancels/redoes it
-            # automatically, so this is a cost tradeoff, not a correctness risk.
+            min_endpointing_delay=0.6,
             preemptive_generation=True,
         )
 
@@ -139,13 +133,6 @@ async def entrypoint(ctx: JobContext):
             room=ctx.room,
         )
 
-        # Handle prolonged user silence (right after the greeting or mid-conversation).
-        # user_away_timeout (default 15s) fires "user_state_changed" -> "away" once both the
-        # user and agent have been idle that long -- but it fires ONLY ONCE per silent
-        # stretch: user_state stays "away" and won't re-arm the framework's own timer again
-        # until real speech resets it. So the nudge -> (wait) -> goodbye escalation is driven
-        # by our own timer here, not by waiting for a second "away" event that will never come
-        # during continuous silence. If the user starts speaking at any point, we bail out.
         away_in_progress = False
         user_spoke = asyncio.Event()
 
@@ -164,7 +151,7 @@ async def entrypoint(ctx: JobContext):
                 )
                 try:
                     await asyncio.wait_for(user_spoke.wait(), timeout=15.0)
-                    return  # user responded, nothing more to do
+                    return 
                 except asyncio.TimeoutError:
                     pass
 
@@ -174,9 +161,7 @@ async def entrypoint(ctx: JobContext):
                         "goodbye and mention they're welcome to reach out again anytime."
                     )
                 )
-                # Don't rely on the LLM to voluntarily call end_call here -- it's not a normal
-                # conversational turn, and testing showed it reliably speaks the goodbye but
-                # doesn't reliably invoke the tool on its own. Hang up deterministically instead.
+               
                 logger.info("ending call: user stayed silent through the away check-in")
                 await ctx.delete_room()
             except Exception:
@@ -192,30 +177,10 @@ async def entrypoint(ctx: JobContext):
 
         session.on("user_state_changed", _on_user_state_changed)
 
-        # Voice-pipeline latency SLA logging. AgentSession already computes these numbers
-        # internally (per-component metrics from the STT/LLM/TTS plugins, plus VAD-based
-        # end-of-utterance timing) -- this just surfaces them per turn so regressions are
-        # visible in the logs instead of only being felt as "the agent feels slow". Targets:
-        #   STT effective latency (via EOU transcription_delay, see caveat below): 100-150ms
-        #   LLM time-to-first-token:                                              150-250ms
-        #   TTS time-to-first-audio-byte:                                         75-150ms
+
         def _on_metrics_collected(ev):
             m = ev.metrics
             if m.type == "eou_metrics":
-                # transcription_delay = last_final_transcript_time - last_speaking_time,
-                # where last_speaking_time comes from a VAD "stopped speaking" event
-                # (livekit-agents' audio_recognition.py). turn_detection="stt" (below) has
-                # no separate VAD driving that timestamp, so this is *always* 0 in this
-                # config -- not evidence STT is fast, just this metric not applying here.
-                # Live-tested and confirmed: two real turns both read exactly 0ms.
-                #
-                # end_of_utterance_delay isn't a substitute ASR-speed number either: it's
-                # time-since-last-speech until the turn is committed, intentionally floored
-                # by min_endpointing_delay (0.8s here) -- the deliberate "make sure they're
-                # done talking" wait, not STT latency. Scoring it against the 100-150ms
-                # target would read "SLOW" on every single turn by construction, which is
-                # the same false signal in the other direction. Log it unscored, for
-                # context only.
                 eou_ms = m.end_of_utterance_delay * 1000
                 if m.transcription_delay > 0:
                     ms = m.transcription_delay * 1000
@@ -240,14 +205,17 @@ async def entrypoint(ctx: JobContext):
                 status = "OK" if ms <= 150 else "SLOW"
                 logger.info("[SLA] TTS ttfb=%.0fms (target 75-150ms) [%s]", ms, status)
             elif m.type == "stt_metrics" and not m.streamed:
-                # Only meaningful for non-streaming STT -- duration is 0.0 while streaming
-                # (which is what this agent uses), so skip logging a always-zero number.
+         
                 logger.info("[SLA] STT duration=%.0fms (non-streaming)", m.duration * 1000)
 
         session.on("metrics_collected", _on_metrics_collected)
 
         background_audio = BackgroundAudioPlayer(
             ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=1.0),
+            thinking_sound=[
+                AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING, volume=0.8),
+                AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING2, volume=0.7),
+            ],
         )
         await background_audio.start(room=ctx.room, agent_session=session)
 
