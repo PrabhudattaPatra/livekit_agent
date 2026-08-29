@@ -7,7 +7,6 @@ from datetime import datetime
 from typing import Type, List, Annotated
 from langgraph.config import get_stream_writer
 from langchain_sarvam import ChatSarvam
-from langchain_groq import ChatGroq
 from pydantic import BaseModel, Field
 from langchain_core.tools import BaseTool
 from dateutil.relativedelta import relativedelta
@@ -20,7 +19,6 @@ from typing import TypedDict
 from langchain_core.messages import BaseMessage, AIMessage, SystemMessage, HumanMessage, ToolMessage
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
-from langchain.agents.middleware import SummarizationMiddleware
 from livekit.agents.telemetry import tracer, trace_types
 from dotenv import load_dotenv
 load_dotenv()
@@ -75,23 +73,78 @@ def _sanitize_events(raw) -> str:
     return json.dumps(clean, ensure_ascii=False, indent=2)
 
 
+def _compute_slot_conflict(sanitized_json: str, requested_start: str, requested_end: str) -> str:
+    """Deterministically checks whether [requested_start, requested_end) overlaps any event
+    returned by search_appointments, so the LLM doesn't have to do interval math itself from
+    raw timestamps -- live testing showed it reliably getting touching-boundary cases wrong
+    (e.g. flagging a 3pm request as busy against an event that ends exactly at 3pm). Touching
+    boundaries do NOT count as a conflict."""
+    try:
+        req_start = datetime.strptime(requested_start, "%Y-%m-%d %H:%M:%S")
+        req_end = datetime.strptime(requested_end, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return "REQUESTED SLOT STATUS: UNKNOWN (could not parse the requested start/end time -- fall back to reading the raw event list below)."
+
+    if sanitized_json.strip() == "No events found.":
+        return f"REQUESTED SLOT STATUS: FREE. No events at all were found on this day, so {requested_start} to {requested_end} is free."
+
+    try:
+        events = json.loads(sanitized_json)
+    except (json.JSONDecodeError, TypeError):
+        return "REQUESTED SLOT STATUS: UNKNOWN (could not parse the calendar events -- fall back to reading the raw event list below)."
+
+    conflicts = []
+    for ev in events:
+        try:
+            ev_start = datetime.fromisoformat(str(ev.get("start", ""))).replace(tzinfo=None)
+            ev_end = datetime.fromisoformat(str(ev.get("end", ""))).replace(tzinfo=None)
+        except (ValueError, TypeError):
+            continue
+        # Standard interval overlap -- an event that starts or ends exactly at the
+        # requested slot's boundary is adjacent, not overlapping, so it's not a conflict.
+        if ev_start < req_end and ev_end > req_start:
+            conflicts.append(ev)
+
+    if conflicts:
+        titles = "; ".join(
+            f"{c.get('title', 'Untitled')} ({c.get('start', '')} to {c.get('end', '')})"
+            for c in conflicts
+        )
+        return f"REQUESTED SLOT STATUS: BUSY. {requested_start} to {requested_end} conflicts with: {titles}."
+    return f"REQUESTED SLOT STATUS: FREE. {requested_start} to {requested_end} does not conflict with anything below."
+
+
 class SearchInput(BaseModel):
     min_datetime: str = Field(description="Start of search range (YYYY-MM-DD HH:MM:SS)")
     max_datetime: str = Field(description="End of search range (YYYY-MM-DD HH:MM:SS)")
+    requested_start_datetime: str | None = Field(
+        default=None,
+        description=(
+            "When checking a SPECIFIC time the caller asked about (e.g. booking or "
+            "rescheduling), pass the exact requested start time here (YYYY-MM-DD HH:MM:SS) "
+            "so the tool can tell you definitively whether it conflicts with anything -- "
+            "don't compute overlap yourself from the raw event list. Omit only for a general "
+            "'what's free that day' browse with no specific time in mind."
+        ),
+    )
+    requested_end_datetime: str | None = Field(
+        default=None,
+        description="End of the requested slot (start + 60 minutes). Required if requested_start_datetime is given.",
+    )
 
 class CustomCalendarSearchTool(BaseTool):
     name: str = "search_appointments"
     description: str = "Checks the interior designer's calendar for available consultation slots on a given day."
     args_schema: Type[BaseModel] = SearchInput
 
-    def _run(self, min_datetime: str, max_datetime: str) -> str:
-        return self._invoke_tool(min_datetime, max_datetime)
+    def _run(self, min_datetime: str, max_datetime: str, requested_start_datetime: str | None = None, requested_end_datetime: str | None = None) -> str:
+        return self._invoke_tool(min_datetime, max_datetime, requested_start_datetime, requested_end_datetime)
 
-    async def _arun(self, min_datetime: str, max_datetime: str) -> str:
+    async def _arun(self, min_datetime: str, max_datetime: str, requested_start_datetime: str | None = None, requested_end_datetime: str | None = None) -> str:
         try:
             # Perform search in a thread to keep async loop free
             return await asyncio.wait_for(
-                asyncio.to_thread(self._invoke_tool, min_datetime, max_datetime),
+                asyncio.to_thread(self._invoke_tool, min_datetime, max_datetime, requested_start_datetime, requested_end_datetime),
                 timeout=15.0
             )
         except asyncio.TimeoutError:
@@ -99,7 +152,7 @@ class CustomCalendarSearchTool(BaseTool):
         except Exception as e:
             return f"TOOL_ERROR: {str(e)}"
 
-    def _invoke_tool(self, min_datetime: str, max_datetime: str) -> str:
+    def _invoke_tool(self, min_datetime: str, max_datetime: str, requested_start_datetime: str | None = None, requested_end_datetime: str | None = None) -> str:
         fixed_params = {
             "calendars_info": '[{"id": "primary", "timeZone": "Asia/Calcutta"}]',  # ✅ fixed
             "max_results": 10
@@ -107,12 +160,17 @@ class CustomCalendarSearchTool(BaseTool):
         payload = {**fixed_params, "min_datetime": min_datetime, "max_datetime": max_datetime}
         try:
             raw = CalendarSearchEvents().invoke(payload)
-            return _sanitize_events(raw)
+            sanitized = _sanitize_events(raw)
         except Exception as e:
             import traceback
             traceback.print_exc()
             print(f"❌ CALENDAR ERROR: {repr(e)}")
             return "TOOL_ERROR: Calendar is temporarily unavailable. Ask the user to try again later."
+
+        if requested_start_datetime and requested_end_datetime:
+            verdict = _compute_slot_conflict(sanitized, requested_start_datetime, requested_end_datetime)
+            return verdict + "\n\n" + sanitized
+        return sanitized
 
 
 class AppointmentInput(BaseModel):
@@ -265,12 +323,7 @@ tools = [
     DeleteEventTool()
 ]
 
-# =============================================================================
-# Hardcoded verbal ack phrases, keyed by tool .name (must match `tools` above).
-# Replaces an earlier LLM-generated ack (ack_llm.ainvoke) that added ~300-600ms of
-# Groq network latency to the "tool is running long, reassure the user" path -- a
-# dict lookup is effectively instantaneous.
-# =============================================================================
+
 TOOL_ACK_PHRASES = {
     "search_appointments": "One moment, let me check available slots for you.",
     "create_appointment": "Okay, booking that consultation for you now.",
@@ -324,8 +377,18 @@ You are interacting with the user via voice through a text-to-speech system. App
 
 - Use available tools as needed, or upon user request.
 - Collect required inputs first. Perform actions silently if the runtime expects it.
+- Right before you call a tool, first speak one short natural sentence acknowledging what you're
+  about to do (e.g. "Sure, let me check that for you," "Okay, booking that now") — vary the
+  wording, don't repeat the same sentence twice in one call — then issue the tool call in the same
+  turn. Keep it to one short sentence; don't describe the tool or its arguments.
 - Speak outcomes clearly. If an action fails, say so once, propose a fallback, or ask how to proceed.
 - When tools return structured data, summarize it to the user in a way that is easy to understand, and don't directly recite identifiers or other technical details.
+- Ground every claim about calendar events, dates, times, or availability strictly in the most
+  recent matching tool result. Never state a conflict, date, or event that is not literally
+  present in that tool's output. If you're not sure availability is still current for a date
+  you're discussing, call search_appointments again for that date rather than guessing.
+- Don't repeat an identical tool call (same tool, same arguments) back-to-back when nothing about
+  the request has changed since the last call — reuse the result you already have.
 
 # Guardrails
 
@@ -376,19 +439,34 @@ Consultations are 60 minutes long.
 2. Preferred Date & Time
 3. Project Focus (e.g. Kitchen, Full Home, Living Room)
 4. Email
-Ask for missing details politely.
+Ask for missing details politely. Once the caller has already given a piece of information
+earlier in this conversation, don't ask for it again — reuse what they said. If a spoken value
+like an email sounds garbled or ambiguous (e.g. an unexpected space or character from
+transcription), read it back once to confirm it rather than silently discarding it and re-asking
+the original question from scratch.
 
 **STEP 1: CHECK AVAILABILITY**
 Use the 'search_appointments' tool.
 Calculate the 'min_datetime' as the start of the requested day (e.g., 2026-01-25 00:00:00).
 Calculate the 'max_datetime' as the end of the requested day (e.g., 2026-01-25 23:59:59).
+Also pass 'requested_start_datetime' as the caller's exact requested time, and
+'requested_end_datetime' as that plus 60 minutes — the tool will tell you definitively whether
+it's free or busy, so you never have to work that out yourself.
+Only run this check when the requested date/time is new or has changed — once you've confirmed a
+slot is free, don't check the same slot again.
 
 **STEP 2: ANALYZE**
-Check the search results.
-If the user's requested time overlaps with an existing consultation, tell the user it is busy and offer the free times.
-If the time is free, FIRST VERIFY with the USER then proceed to booking.
+Read the "REQUESTED SLOT STATUS" line at the top of the tool result and trust it exactly — do not
+re-derive availability yourself from the raw event timestamps below it, and never state a
+conflict or event that isn't named on that line.
+If it says BUSY, tell the user that specific time is busy (citing only the conflicting event(s)
+named on that line) and offer free times around it.
+If it says FREE, the time is free — FIRST VERIFY with the USER then proceed to booking.
 
 **STEP 3: BOOK**
+Once you have all four required details AND the user has confirmed the specific date/time you
+verified is free, call 'create_appointment' right away in that same turn — don't re-ask for
+anything already given, and don't re-run the availability check again first.
 Use the 'create_appointment' tool with the confirmed details. Base the 'summary' on the project focus, and compose the 'description' as a short recap of what was discussed — home type, style preferences, budget range, and key goals — so the designer can review it before the call.
 
 ==================================================
@@ -409,12 +487,16 @@ Step 3: COLLECT UPDATES
 - Ask: 'Do you want to change the project focus?'
 
 Step 4: CHECK AVAILABILITY
-Use the 'search_appointments' tool.
+Use the 'search_appointments' tool. Pass 'requested_start_datetime' as the new requested time and
+'requested_end_datetime' as that plus 60 minutes, along with the day's 'min_datetime'/'max_datetime'.
 
 Step 5: ANALYZE
-Check the search results.
-If the user's requested time overlaps with an existing consultation, tell the user it is busy and offer the free times.
-If the time is free, proceed to booking.
+Read the "REQUESTED SLOT STATUS" line at the top of the tool result and trust it exactly — do not
+re-derive availability yourself from the raw event timestamps below it, and never state a
+conflict or event that isn't named on that line.
+If it says BUSY, tell the user it's busy (citing only the conflicting event(s) named on that
+line) and offer free times.
+If it says FREE, proceed to booking.
 
 Step 6: PREPARE SUMMARY (IMPORTANT LOGIC)
 - If the user provides a NEW title: Use that new title.
@@ -449,61 +531,12 @@ Step 4: EXECUTE
 """
 
 
-# Small/cheap utility model. Formerly also used to generate tool-call ack phrases
-# live (see TOOL_ACK_PHRASES above for why that was replaced with a hardcoded dict) --
-# its only remaining job is conversation summarization, below.
-ack_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.7)
-
-# Compresses older turns into a running summary once the conversation crosses ~20
-# messages, keeping the most recent 12 verbatim. Reuses ack_llm (fast/cheap Groq
-# model) since this is a background bookkeeping call, not something the caller needs
-# a "smart" model for. Message-count based
-# (not token-based) to match the rest of this codebase and avoid needing model
-# profile/context-limit data we don't have visibility into via Portkey.
-#
-# Uses a custom summary_prompt instead of the middleware's default -- the default is
-# written for coding agents ("SESSION INTENT / ARTIFACTS / NEXT STEPS") and, tested
-# live against ack_llm, reliably let concrete facts (a caller's name and email) get
-# paraphrased away as "not directly related to booking an appointment" instead of
-# preserved. For a booking call, caller-provided facts (name, email, phone, room type,
-# budget, dates, preferences) are exactly what must never be lost, so the prompt below
-# demands they come through verbatim.
-BOOKING_SUMMARY_PROMPT = """You are compressing an interior design consultation phone call so the assistant can resume it seamlessly without losing anything the caller already said.
-
-Extract every concrete fact the caller has given so far. Do NOT omit, generalize, or paraphrase away any specific value: names, email addresses, phone numbers, room types, budgets, dates/times, style preferences, and any appointment details already discussed or confirmed. If a fact was stated, it MUST appear verbatim in your output, even if it seems unrelated to what happens next -- you cannot judge what will matter later.
-
-Respond with:
-KNOWN FACTS: a bulleted list of every concrete fact stated so far (verbatim values, not summarized).
-WHERE WE LEFT OFF: one line describing what was being discussed or decided.
-
-Conversation so far:
-{messages}
-"""
-
-summarization_middleware = SummarizationMiddleware(
-    model=ack_llm,
-    trigger=("messages", 20),
-    keep=("messages", 12),
-    summary_prompt=BOOKING_SUMMARY_PROMPT,
-)
-
 def get_ack_phrase(tool_call: dict) -> str:
     """Returns a hardcoded, per-tool verbal acknowledgment phrase. Replaces a former
-    LLM round-trip (ack_llm.ainvoke) that added ~300-600ms of Groq network latency to
+    LLM round-trip (a small Groq model) that added ~300-600ms of network latency to
     this path; a dict lookup is effectively free."""
     tool_name = tool_call.get("name", "")
     return TOOL_ACK_PHRASES.get(tool_name, DEFAULT_ACK_PHRASE)
-
-
-async def summarize_node(state: ChatState):
-    """Runs before chat_node on every turn. A no-op (returns {}) on the vast majority
-    of turns where the message-count threshold hasn't been crossed. When it does fire,
-    the update (RemoveMessage(REMOVE_ALL_MESSAGES) + summary + preserved messages) is
-    applied to the checkpointed state via the add_messages reducer, so the compression
-    actually persists in Postgres -- unlike chat_node's old [-10:] slice, this isn't
-    recomputed from scratch (and thrown away) on every single turn."""
-    result = await summarization_middleware.abefore_model(state, None)
-    return result or {}
 
 
 async def chat_node(state: ChatState):
@@ -537,21 +570,44 @@ async def chat_node(state: ChatState):
     full_response = None
     stop_streaming = False
     ack_spoken = False
+    content_spoken = False  # did the model itself say something before/at the tool call?
 
     try:
         async for chunk in llm_with_tools.astream(messages_with_system):
-            # If Langchain detects a tool call chunk, stop streaming text
             tool_call_chunks = getattr(chunk, "tool_call_chunks", None)
-            if getattr(chunk, "tool_calls", None) or tool_call_chunks:
+            has_tool_call = bool(getattr(chunk, "tool_calls", None) or tool_call_chunks)
+
+            # Speak any natural leading content first, even if this same chunk also
+            # carries a tool_call_chunk -- must run before stop_streaming is set below,
+            # so a model-native lead-in ("Sure, let me check that...") isn't dropped.
+            if (
+                chunk.content
+                and isinstance(chunk.content, str)
+                and not stop_streaming
+            ):
+                text = chunk.content
+                if "<function" in text or "<tool" in text:
+                    stop_streaming = True
+                    text = text.split("<function")[0].split("<tool")[0]
+
+                if text == "<" or text == "</":
+                    continue
+
+                if text:
+                    stream_writer(text)
+                    # Sarvam's completions routinely lead with a bare "\n" before any
+                    # real words -- don't let that whitespace-only chunk count as a
+                    # spoken ack, or it silently suppresses the fallback phrase below
+                    # while saying nothing audible at all.
+                    if text.strip():
+                        content_spoken = True
+
+            if has_tool_call:
                 stop_streaming = True
-                # Speak the hardcoded ack the instant the tool's name is known --
-                # the `name` field arrives on the first chunk, before `args` streams
-                # in (see langchain_core.messages.tool.ToolCallChunk) -- so we don't
-                # have to wait for the full tool-call JSON to finish generating, let
-                # alone the extra 0.5s gate tool_node_with_ack used to add on top of
-                # that. This is the dominant latency in a tool-calling turn, so speak
-                # unconditionally here rather than gating on the tool turning out slow.
-                if not ack_spoken and tool_call_chunks:
+
+                # Only fall back to the hardcoded phrase if the model didn't already
+                # say something natural for this turn.
+                if not ack_spoken and not content_spoken and tool_call_chunks:
                     tool_name = next(
                         (tc.get("name") for tc in tool_call_chunks if tc.get("name")),
                         None,
@@ -560,25 +616,6 @@ async def chat_node(state: ChatState):
                         stream_writer(get_ack_phrase({"name": tool_name}))
                         ack_spoken = True
 
-            if (
-                chunk.content
-                and isinstance(chunk.content, str)
-                and not stop_streaming
-            ):
-                text = chunk.content
-                # Heuristic to catch Groq/Llama raw tool call syntax
-                if "<function" in text or "<tool" in text:
-                    stop_streaming = True
-                    text = text.split("<function")[0].split("<tool")[0]
-                
-                # Check for stray opening brackets that might be tool calls
-                if text == "<" or text == "</":
-                    # Buffer it or just skip it. For simplicity, we can skip standalone '<'
-                    continue
-
-                if text:
-                    stream_writer(text)
-            
             full_response = chunk if full_response is None else full_response + chunk
     except Exception as e:
         import traceback
@@ -627,8 +664,6 @@ async def tool_node_with_ack(state: ChatState):
                     trace_types.ATTR_FUNCTION_TOOL_ARGS: json.dumps(call.get("args", {})),
                     trace_types.ATTR_FUNCTION_TOOL_OUTPUT: output_text,
                     trace_types.ATTR_FUNCTION_TOOL_IS_ERROR: is_error,
-                    # Bridges the tool call into langsmith_processor's running
-                    # conversation transcript for this trace.
                     "lk.function_tool.user_context": str(user_message),
                 },
             )
@@ -641,12 +676,10 @@ async def tool_node_with_ack(state: ChatState):
 def create_interior_design_graph(checkpointer=None):
     graph = StateGraph(ChatState)
 
-    graph.add_node("summarize", summarize_node)
     graph.add_node("chat_node", chat_node)
     graph.add_node("tools", tool_node_with_ack)
 
-    graph.add_edge(START, "summarize")
-    graph.add_edge("summarize", "chat_node")
+    graph.add_edge(START, "chat_node")
     graph.add_conditional_edges("chat_node", tools_condition)
     graph.add_edge("tools", "chat_node")
 

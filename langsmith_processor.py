@@ -160,11 +160,7 @@ class LangSmithSpanProcessor(SpanProcessor):
             if tool_output:
                 self._set_completion_attributes(span, [{"role": "tool", "content": str(tool_output)}])
 
-            # Register the user turn that triggered this tool BEFORE folding in the tool
-            # entry, in case this span is processed before the LLM span for the same turn
-            # finishes (tool spans close mid-generation, nested inside the still-open
-            # llm_node span) -- otherwise _split_conversation_messages would silently drop
-            # a tool entry that arrives before any user message is on record for this trace.
+           
             if user_context:
                 self._track_messages(self.conversation_messages, trace_id, [{"role": "user", "content": user_context}], "")
             status = "ERROR" if tool_is_error else "OK"
