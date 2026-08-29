@@ -53,7 +53,14 @@ class LangSmithSpanProcessor(SpanProcessor):
         # Use print to stderr to ensure it's visible
         import sys
         print(f"[LANGSMITH-PROCESSOR] Processing span: {span.name}", file=sys.stderr, flush=True)
-        
+
+        # span._attributes arrives here as a frozen BoundedAttributes snapshot (current
+        # opentelemetry-sdk hands on_end() a read-only view) -- every assignment below
+        # (span._attributes[...] = ...) raises TypeError against that frozen mapping,
+        # which was crashing every single job before the agent ever joined the room.
+        # Swap in a plain, always-mutable dict copy so those in-place writes work.
+        span._attributes = dict(span._attributes) if span._attributes else {}
+
         # Track each conversation as a thread in LangSmith
         trace_id = format(span.context.trace_id, '032x')
         span._attributes["langsmith.metadata.thread_id"] = trace_id
