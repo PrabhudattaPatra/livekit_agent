@@ -236,5 +236,17 @@ if __name__ == "__main__":
             agent_name="InteriorDesignAgent",
             num_idle_processes=1,
             load_threshold=float("inf"),
+            # Render Web Services set $PORT themselves and route to exactly that port --
+            # without this, WorkerOptions falls back to livekit-agents' own fixed prod
+            # default (8081), and Render has to fall back to guessing the port by
+            # scraping "listening on :XXXX" from stdout, then restarting the deploy to
+            # patch its routing once it figures it out (seen live: "New primary port
+            # detected: 8081. Restarting deploy to update network configuration..."). That
+            # reactive path left the container healthy but the public edge unattached
+            # (dashboard said "Live", the public URL 502'd with x-render-routing:
+            # no-deploy). Binding directly to $PORT lets Render route correctly from the
+            # first boot, no guessing/restart needed. Falls back to 8081 for local/dev
+            # runs where $PORT isn't set.
+            port=int(os.getenv("PORT", "8081")),
         )
     )
