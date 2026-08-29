@@ -234,5 +234,14 @@ if __name__ == "__main__":
         WorkerOptions(
             entrypoint_fnc=entrypoint,
             agent_name="InteriorDesignAgent",
+            # Production defaults to 4 idle standby processes, each a full copy of this
+            # process's imports (langchain/langgraph/opentelemetry/google-api-client/etc)
+            # kept warm to pick up a job instantly. That's fine on a beefy host, but on
+            # Render's smaller instance tiers it OOM-kills the container before a single
+            # call connects -- observed: 4 idle processes + main process blew past the
+            # memory limit within ~15s of startup. 1 keeps one warm process for fast
+            # pickup without multiplying memory 4x; drop to 0 if OOM still happens (trades
+            # away the warm-start latency win entirely, only spawns a process on demand).
+            num_idle_processes=1,
         )
     )
