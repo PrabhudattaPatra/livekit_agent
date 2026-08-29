@@ -243,5 +243,16 @@ if __name__ == "__main__":
             # pickup without multiplying memory 4x; drop to 0 if OOM still happens (trades
             # away the warm-start latency win entirely, only spawns a process on demand).
             num_idle_processes=1,
+            # Prod mode enforces load_threshold=0.7 by default (dev mode disables it
+            # entirely, at inf) -- the default load_fnc reads psutil CPU usage, which on
+            # Render's fractional-vCPU instances reads ~0.97-0.99 from idle startup alone
+            # (observed: "worker is at full capacity, marking as unavailable" seconds
+            # after boot, with zero jobs running -- a cgroup-quota misread, not real
+            # load). A worker marked unavailable stops receiving new LiveKit dispatches,
+            # so left at the 0.7 default this silently blackholes every call on this
+            # host. Disabling it is safe here: this is a single low-traffic worker, not a
+            # pool where shedding load protects sibling workers, and memory (the actual
+            # constrained resource) is already capped via num_idle_processes above.
+            load_threshold=float("inf"),
         )
     )
